@@ -22,6 +22,13 @@ import AppKit
 
 final class TileCancelDot: NSPanel {
 
+    private struct PanelPlacement {
+        let windowFrame: NSRect
+        let layoutOrigin: NSPoint
+        let displayOffset: NSPoint
+        let pointerEdge: BentoPointerEdge?
+    }
+
     // MARK: - Layout constants (single-display)
 
     /// Panel size in points. ~16:10 ratio so the tile previews read as
@@ -29,6 +36,9 @@ final class TileCancelDot: NSPanel {
     /// small enough not to swallow the underlying window.
     static let panelWidth: CGFloat = 290
     static let panelHeight: CGFloat = 185
+
+    /// Room for the shadow and, when displaced, the popover pointer.
+    private static let screenInset: CGFloat = 12
 
     /// Padding between the panel chrome and the grid of tiles.
     static let chromePadding: CGFloat = 12
@@ -79,13 +89,13 @@ final class TileCancelDot: NSPanel {
     /// path — pixel-identical to the pre-multi-display behaviour.
     var multiDisplayEnabled: Bool = false
 
-    /// NS origin of the IDEAL (un-clipped) multi-display panel rect.
-    /// Tracked separately from `self.frame.origin` because the actual
-    /// window frame is clipped to the current display's visibleFrame —
-    /// the view draws and `resolve(...)` hit-tests in the un-clipped
-    /// coord space so the cursor's relationship to each card cell stays
-    /// honest even when the window is smaller than the layout.
-    fileprivate var idealPanelOriginNS: NSPoint?
+    /// Origin used by the current layout's hit testing. It differs from the
+    /// window origin only when an oversized multi-display layout is clipped.
+    fileprivate var layoutOriginNS: NSPoint?
+
+    /// The immutable middle-button press point. Single-display direction
+    /// selection stays relative to this point even when the panel moves.
+    private var gestureOriginNS: NSPoint?
 
     // MARK: - Subviews
 
@@ -96,6 +106,7 @@ final class TileCancelDot: NSPanel {
     /// above the bento. A separate panel (not part of this one) so the grid
     /// stays pixel-for-pixel and the anchor is identical for 1 or N cards.
     private let targetChip = BentoTargetChip()
+    private let anchorPointer = BentoAnchorPointer()
     private var targetAppName: String?
     private var targetAppIcon: NSImage?
 
@@ -191,25 +202,30 @@ final class TileCancelDot: NSPanel {
     private func showSingleDisplay(atCGPoint cgScreenPoint: CGPoint) {
         guard let primary = NSScreen.screens.first else { return }
         let nsY = primary.frame.height - cgScreenPoint.y
+        let clickNS = NSPoint(x: cgScreenPoint.x, y: nsY)
+        let currentScreen = NSScreen.screens.first(where: { $0.frame.contains(clickNS) }) ?? primary
 
-        let frame = NSRect(
+        let idealFrame = NSRect(
             x: cgScreenPoint.x - Self.panelWidth / 2,
             y: nsY - Self.panelHeight / 2,
             width: Self.panelWidth,
             height: Self.panelHeight
         )
-        setFrame(frame, display: true)
+        let placement = Self.placePanel(idealFrame: idealFrame, visibleFrame: currentScreen.visibleFrame)
+        gestureOriginNS = clickNS
+        layoutOriginNS = placement.layoutOrigin
+        setFrame(placement.windowFrame, display: true)
         fillView.displayLayout = nil
         fillView.currentScreen = nil
         fillView.activeScreen = nil
         fillView.activeZone = nil
-        fillView.displayOffset = .zero
-        idealPanelOriginNS = nil
+        fillView.displayOffset = placement.displayOffset
         fillView.needsDisplay = true
         if !isVisible {
             orderFrontRegardless()
         }
-        positionTargetChip(panelFrame: frame)
+        positionAnchorPointer(placement.pointerEdge, point: clickNS, panelFrame: placement.windowFrame)
+        positionTargetChip(panelFrame: placement.windowFrame)
     }
 
     private func showMultiDisplay(atCGPoint cgScreenPoint: CGPoint) {
@@ -239,41 +255,21 @@ final class TileCancelDot: NSPanel {
             height: result.panelSize.height
         )
 
-        // Clip the WINDOW frame to the current display's visibleFrame
-        // (intersection). Anything outside becomes a region we just
-        // won't have a window for — the view inside the window draws
-        // every card at its *ideal* panel-local position, so cards
-        // whose position falls outside the (smaller) window are
-        // naturally clipped by the view bounds and never appear. This
-        // preserves "cancel cell sits exactly on the cursor" without
-        // needing the panel to straddle two displays (which macOS won't
-        // do with "Displays have separate Spaces" on).
-        let visible = currentScreen.visibleFrame
-        let clippedFrame = idealFrame.intersection(visible)
-        // Defensive: if the click somehow doesn't put the current card
-        // on the current display, fall back to the ideal frame.
-        let windowFrame = clippedFrame.isEmpty ? idealFrame : clippedFrame
-
-        // How much of the ideal panel's bottom-left got cut. View-local
-        // (0,0) corresponds to ideal panel-local `displayOffset`, so
-        // every card's view-local position = panel-local − displayOffset.
-        let displayOffset = NSPoint(
-            x: windowFrame.minX - idealFrame.minX,
-            y: windowFrame.minY - idealFrame.minY
-        )
-
-        idealPanelOriginNS = idealFrame.origin
-        setFrame(windowFrame, display: true)
+        let placement = Self.placePanel(idealFrame: idealFrame, visibleFrame: currentScreen.visibleFrame)
+        gestureOriginNS = clickNS
+        layoutOriginNS = placement.layoutOrigin
+        setFrame(placement.windowFrame, display: true)
         fillView.displayLayout = result.cards
         fillView.currentScreen = currentScreen
         fillView.activeScreen = nil
         fillView.activeZone = nil
-        fillView.displayOffset = displayOffset
+        fillView.displayOffset = placement.displayOffset
         fillView.needsDisplay = true
         if !isVisible {
             orderFrontRegardless()
         }
-        positionTargetChip(panelFrame: windowFrame)
+        positionAnchorPointer(placement.pointerEdge, point: clickNS, panelFrame: placement.windowFrame)
+        positionTargetChip(panelFrame: placement.windowFrame)
     }
 
     func hide() {
@@ -281,6 +277,9 @@ final class TileCancelDot: NSPanel {
             orderOut(nil)
         }
         targetChip.hide()
+        anchorPointer.hide()
+        gestureOriginNS = nil
+        layoutOriginNS = nil
         // Drop the target so a stray show() without a fresh setTarget(...)
         // can't surface the previous gesture's app name/icon.
         targetAppName = nil
@@ -289,6 +288,71 @@ final class TileCancelDot: NSPanel {
 
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+
+    // MARK: - Edge-safe placement
+
+    private static func placePanel(idealFrame: NSRect, visibleFrame: NSRect) -> PanelPlacement {
+        let insetVisible = visibleFrame.insetBy(dx: screenInset, dy: screenInset)
+        let available = insetVisible.width > 0 && insetVisible.height > 0
+            ? insetVisible
+            : visibleFrame
+
+        let x = placeAxis(idealMin: idealFrame.minX, size: idealFrame.width,
+                          availableMin: available.minX, availableMax: available.maxX)
+        let y = placeAxis(idealMin: idealFrame.minY, size: idealFrame.height,
+                          availableMin: available.minY, availableMax: available.maxY)
+
+        let pointerEdge: BentoPointerEdge?
+        if abs(x.shift) >= abs(y.shift), x.shift != 0 {
+            pointerEdge = x.shift > 0 ? .left : .right
+        } else if y.shift != 0 {
+            pointerEdge = y.shift > 0 ? .bottom : .top
+        } else {
+            pointerEdge = nil
+        }
+
+        return PanelPlacement(
+            windowFrame: NSRect(x: x.windowMin, y: y.windowMin,
+                                width: x.windowSize, height: y.windowSize),
+            layoutOrigin: NSPoint(x: x.layoutMin, y: y.layoutMin),
+            displayOffset: NSPoint(x: x.windowMin - x.layoutMin,
+                                   y: y.windowMin - y.layoutMin),
+            pointerEdge: pointerEdge
+        )
+    }
+
+    private static func placeAxis(
+        idealMin: CGFloat,
+        size: CGFloat,
+        availableMin: CGFloat,
+        availableMax: CGFloat
+    ) -> (windowMin: CGFloat, windowSize: CGFloat, layoutMin: CGFloat, shift: CGFloat) {
+        let availableSize = availableMax - availableMin
+        if size <= availableSize {
+            let placedMin = max(availableMin, min(idealMin, availableMax - size))
+            return (placedMin, size, placedMin, placedMin - idealMin)
+        }
+
+        let idealMax = idealMin + size
+        let clippedMin = max(idealMin, availableMin)
+        let clippedMax = min(idealMax, availableMax)
+        guard clippedMax > clippedMin else {
+            return (availableMin, availableSize, idealMin, 0)
+        }
+        return (clippedMin, clippedMax - clippedMin, idealMin, 0)
+    }
+
+    private func positionAnchorPointer(
+        _ edge: BentoPointerEdge?,
+        point: NSPoint,
+        panelFrame: NSRect
+    ) {
+        guard let edge else {
+            anchorPointer.hide()
+            return
+        }
+        anchorPointer.show(attachedTo: panelFrame, edge: edge, pointingAt: point)
+    }
 
     // MARK: - Layout computation (multi-display)
 
@@ -393,14 +457,14 @@ final class TileCancelDot: NSPanel {
             // correctly. The window's frame is a clipped subset of the
             // ideal — cardRects are stored in ideal panel-local coords,
             // and so is `cursorLocal` here.
-            let originNS = idealPanelOriginNS ?? self.frame.origin
+            let originNS = layoutOriginNS ?? self.frame.origin
             let local = NSPoint(
                 x: cursorNS.x - originNS.x,
                 y: cursorNS.y - originNS.y
             )
             return Self.resolveMultiDisplay(cursorLocal: local, layout: layout)
         } else {
-            return resolveSingleDisplay(cursorNS: cursorNS, panelFrame: self.frame)
+            return resolveSingleDisplay(cursorNS: cursorNS)
         }
     }
 
@@ -432,15 +496,15 @@ final class TileCancelDot: NSPanel {
     }
 
     private func resolveSingleDisplay(
-        cursorNS: NSPoint,
-        panelFrame: NSRect
+        cursorNS: NSPoint
     ) -> (screen: NSScreen, zone: TileZone)? {
         // Single-display: the cells extend to infinity, so resolve from
         // the panel-relative offset and look up which screen the cursor
         // is currently on (since the tile target follows the cursor's
         // display, not a specific panel-local one).
-        let dx = cursorNS.x - panelFrame.midX
-        let dy = panelFrame.midY - cursorNS.y  // flip to y-down for the existing math
+        let origin = gestureOriginNS ?? NSPoint(x: frame.midX, y: frame.midY)
+        let dx = cursorNS.x - origin.x
+        let dy = origin.y - cursorNS.y  // flip to y-down for the existing math
         let zone = TileZone.bentoZone(
             forDx: dx, dy: dy,
             halfDeadzoneWidth: Self.halfDeadzoneWidth,
